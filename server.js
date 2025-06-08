@@ -1,22 +1,18 @@
 const express = require('express');
-const { google } = require('googleapis');
 const cors = require('cors');
-const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
+const { google } = require('googleapis');
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001; // Railway環境変数対応
 
-// Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// Google Auth Setup
-const CREDENTIALS_PATH = path.join(__dirname, 'client_credentials.json');
-const TOKEN_PATH = path.join(__dirname, 'token.json');
+// 認証関連の設定
+let oauth2Client = null;
+let credentials = null;
 
-// Required scopes for full automation
+// スコープ設定
 const SCOPES = [
   'https://www.googleapis.com/auth/drive.scripts',
   'https://www.googleapis.com/auth/drive',
@@ -24,304 +20,434 @@ const SCOPES = [
   'https://www.googleapis.com/auth/script.projects'
 ];
 
-// OAuth redirect URI for local development
-const REDIRECT_URI = 'http://localhost';
-
-let auth = null;
-
-// Initialize Google Auth
+// 認証情報の初期化（クラウド対応）
 async function initializeAuth() {
-  console.log('🔧 Starting authentication initialization...');
-  console.log('📁 Looking for credentials at:', CREDENTIALS_PATH);
-  
   try {
-    // Check if credentials file exists
-    if (!fs.existsSync(CREDENTIALS_PATH)) {
-      console.error('❌ client_credentials.json not found!');
-      console.log('📁 Expected location:', CREDENTIALS_PATH);
-      console.log('🔧 Please download OAuth 2.0 credentials from Google Cloud Console');
-      return;
+    // 環境変数から認証情報を取得
+    const credentialsEnv = process.env.GOOGLE_CREDENTIALS_JSON;
+    
+    if (credentialsEnv) {
+      // 環境変数から認証情報を読み込み
+      credentials = JSON.parse(credentialsEnv);
+      console.log('✅ Credentials loaded from environment variables');
+    } else {
+      // ローカル開発用フォールバック
+      console.log('⚠️ GOOGLE_CREDENTIALS_JSON not found, checking local file...');
+      const fs = require('fs').promises;
+      const path = require('path');
+      const credentialsPath = path.join(__dirname, 'client_credentials.json');
+      const credentialsContent = await fs.readFile(credentialsPath, 'utf8');
+      credentials = JSON.parse(credentialsContent);
+      console.log('✅ Credentials loaded from local file');
+    }
+    
+    console.log('📋 Credentials info:', {
+      type: credentials.type || 'Not specified',
+      clientId: credentials.installed?.client_id || credentials.web?.client_id || 'Not found',
+      hasClientSecret: !!(credentials.installed?.client_secret || credentials.web?.client_secret)
+    });
+
+    // OAuth2クライアントの設定
+    const clientConfig = credentials.installed || credentials.web;
+    if (!clientConfig) {
+      throw new Error('Invalid credentials format. Expected "installed" or "web" configuration.');
     }
 
-    console.log('✅ Credentials file found');
-    const credentialsContent = fs.readFileSync(CREDENTIALS_PATH, 'utf8');
-    console.log('📄 Credentials file size:', credentialsContent.length, 'bytes');
+    // クラウド環境対応のリダイレクトURI設定
+    const baseUrl = process.env.RAILWAY_STATIC_URL 
+      ? `https://${process.env.RAILWAY_STATIC_URL}`
+      : process.env.RENDER_EXTERNAL_URL
+      ? process.env.RENDER_EXTERNAL_URL
+      : `http://localhost:${PORT}`;
+
+    oauth2Client = new google.auth.OAuth2(
+      clientConfig.client_id,
+      clientConfig.client_secret,
+      `${baseUrl}/oauth/callback`
+    );
+
+    console.log(`🔗 OAuth2 client initialized with redirect: ${baseUrl}/oauth/callback`);
     
-    const credentials = JSON.parse(credentialsContent);
-    console.log('✅ Credentials parsed successfully');
+    // 保存されたトークンの読み込み試行
+    await loadSavedTokens();
     
-    const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web;
-    
-    if (!client_secret || !client_id || !redirect_uris) {
-      console.error('❌ Invalid credentials format');
-      console.log('Expected fields: client_secret, client_id, redirect_uris');
-      console.log('Found keys:', Object.keys(credentials.installed || credentials.web || {}));
-      return;
-    }
-    
-    console.log('✅ Credentials validation passed');
-    console.log('🔑 Client ID:', client_id.substring(0, 20) + '...');
-    console.log('🔄 Redirect URI from credentials:', redirect_uris[0]);
-    console.log('🔄 Using redirect URI:', REDIRECT_URI);
-    
-    // Use consistent redirect URI
-    auth = new google.auth.OAuth2(client_id, client_secret, REDIRECT_URI);
-    console.log('✅ OAuth2 client initialized');
-    
-    // Try to load existing token
-    if (fs.existsSync(TOKEN_PATH)) {
-      try {
-        const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
-        auth.setCredentials(token);
-        console.log('✅ Existing token loaded successfully');
-        
-        // Verify token is still valid
-        try {
-          await auth.getAccessToken();
-          console.log('✅ Token is valid and ready');
-        } catch (tokenError) {
-          console.log('⚠️ Token exists but may be expired, reauthorization may be needed');
-        }
-      } catch (tokenParseError) {
-        console.log('❌ Error parsing existing token:', tokenParseError.message);
-        console.log('🔧 Will need fresh authorization');
-      }
-    } else {
-      console.log('❌ No existing token found. Authorization needed.');
-    }
   } catch (error) {
-    console.error('❌ Error during authentication initialization:', error.message);
-    console.log('🔧 Please check if client_credentials.json is valid JSON');
-    console.error('Full error:', error);
+    console.error('❌ Failed to initialize auth:', error.message);
+    throw error;
   }
 }
 
-// OAuth Authorization Endpoint
-app.get('/authorize', async (req, res) => {
-  console.log('📞 Authorization request received');
-  
-  if (!auth) {
-    console.log('❌ Auth not initialized');
-    return res.status(500).json({ error: 'Auth not initialized' });
-  }
-  
+// 保存されたトークンの読み込み（クラウド対応）
+async function loadSavedTokens() {
   try {
-    const authUrl = auth.generateAuthUrl({
+    // 環境変数からトークンを取得
+    const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+    const accessToken = process.env.GOOGLE_ACCESS_TOKEN;
+    
+    if (refreshToken) {
+      const tokens = {
+        refresh_token: refreshToken,
+        ...(accessToken && { access_token: accessToken })
+      };
+      
+      oauth2Client.setCredentials(tokens);
+      console.log('✅ Tokens loaded from environment variables');
+      return true;
+    } else {
+      // ローカル開発用フォールバック
+      const fs = require('fs').promises;
+      const path = require('path');
+      const tokensPath = path.join(__dirname, 'tokens.json');
+      const tokensContent = await fs.readFile(tokensPath, 'utf8');
+      const tokens = JSON.parse(tokensContent);
+      oauth2Client.setCredentials(tokens);
+      console.log('✅ Tokens loaded from local file');
+      return true;
+    }
+  } catch (error) {
+    console.log('⚠️ No saved tokens found:', error.message);
+    return false;
+  }
+}
+
+// 認証URL生成
+app.get('/mcp/authorize', async (req, res) => {
+  try {
+    if (!oauth2Client) {
+      await initializeAuth();
+    }
+
+    const authUrl = oauth2Client.generateAuthUrl({
       access_type: 'offline',
       scope: SCOPES,
       response_type: 'code',
-      include_granted_scopes: true
+      prompt: 'consent'
     });
-    
-    console.log('✅ Authorization URL generated');
-    console.log('🔗 Auth URL:', authUrl.substring(0, 100) + '...');
-    
-    res.json({ 
-      authUrl,
-      message: 'Visit this URL to authorize the application',
-      instructions: 'After authorization, call /callback with the code parameter'
-    });
-  } catch (error) {
-    console.error('❌ Error generating auth URL:', error);
-    res.status(500).json({ error: 'Failed to generate auth URL', details: error.message });
-  }
-});
 
-// OAuth Callback Endpoint
-app.post('/callback', async (req, res) => {
-  const { code } = req.body;
-  console.log('📞 Callback request received');
-  console.log('🔍 Code length:', code ? code.length : 'undefined');
-  
-  if (!code) {
-    console.log('❌ No authorization code provided');
-    return res.status(400).json({ error: 'Authorization code required' });
-  }
-  
-  try {
-    console.log('🔄 Exchanging code for tokens...');
-    
-    // Use getToken instead of getAccessToken for proper token exchange
-    const tokenResponse = await auth.getToken(code);
-    console.log('✅ Token response received');
-    console.log('🔍 Token response keys:', Object.keys(tokenResponse));
-    
-    const tokens = tokenResponse.tokens;
-    if (!tokens) {
-      console.error('❌ No tokens in response:', tokenResponse);
-      return res.status(500).json({ 
-        error: 'Invalid token response', 
-        details: 'No tokens received from Google OAuth' 
-      });
-    }
-    
-    console.log('✅ Tokens extracted successfully');
-    console.log('🔑 Token types:', Object.keys(tokens));
-    
-    auth.setCredentials(tokens);
-    
-    // Save token for future use
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
-    console.log('✅ Tokens saved to:', TOKEN_PATH);
-    
-    res.json({ 
-      success: true, 
-      message: 'Authorization successful',
-      tokenSaved: true,
-      tokenTypes: Object.keys(tokens)
-    });
-  } catch (error) {
-    console.error('❌ Error during token exchange:', error);
-    console.error('❌ Error stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Failed to get access token', 
-      details: error.message,
-      errorType: error.constructor.name
-    });
-  }
-});
-
-// Create Container Bound Script
-app.post('/create_container_bound_script', async (req, res) => {
-  const { spreadsheetId, title } = req.body;
-  console.log('📞 Create container bound script request:', { spreadsheetId, title });
-  
-  if (!spreadsheetId || !title) {
-    return res.status(400).json({ error: 'spreadsheetId and title are required' });
-  }
-  
-  try {
-    const script = google.script({ version: 'v1', auth });
-    
-    // Create a new Apps Script project
-    const projectResponse = await script.projects.create({
-      requestBody: {
-        title: title,
-        parentId: spreadsheetId
-      }
-    });
-    
-    const scriptId = projectResponse.data.scriptId;
-    const url = `https://script.google.com/d/${scriptId}/edit`;
-    
-    console.log('✅ Container bound script created:', scriptId);
-    
-    res.json({
-      scriptId,
-      url,
-      success: true
-    });
-  } catch (error) {
-    console.error('❌ Error creating container bound script:', error);
-    res.status(500).json({ 
-      error: 'Failed to create container bound script', 
-      details: error.message 
-    });
-  }
-});
-
-// Update Script Content
-app.put('/update_script_content', async (req, res) => {
-  const { scriptId, files } = req.body;
-  console.log('📞 Update script content request:', { scriptId, filesCount: files?.length });
-  
-  if (!scriptId || !files) {
-    return res.status(400).json({ error: 'scriptId and files are required' });
-  }
-  
-  try {
-    const script = google.script({ version: 'v1', auth });
-    
-    const updateResponse = await script.projects.updateContent({
-      scriptId: scriptId,
-      requestBody: {
-        files: files
-      }
-    });
-    
-    console.log('✅ Script content updated successfully');
+    console.log('🔗 Generated auth URL:', authUrl);
     
     res.json({
       success: true,
-      updatedFiles: updateResponse.data.files.length
+      authUrl: authUrl,
+      message: 'Please visit this URL to complete OAuth authorization',
+      instructions: 'Copy the authorization code from the callback and use /oauth/token endpoint'
     });
   } catch (error) {
-    console.error('❌ Error updating script content:', error);
-    res.status(500).json({ 
-      error: 'Failed to update script content', 
-      details: error.message 
+    console.error('❌ Auth URL generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
 
-// Run Script Function
-app.post('/run_script', async (req, res) => {
-  const { scriptId, function: functionName, parameters = [] } = req.body;
-  console.log('📞 Run script request:', { scriptId, functionName, parametersCount: parameters.length });
-  
-  if (!scriptId || !functionName) {
-    return res.status(400).json({ error: 'scriptId and function are required' });
-  }
-  
+// OAuth コールバック処理
+app.get('/oauth/callback', async (req, res) => {
   try {
-    const script = google.script({ version: 'v1', auth });
+    const { code } = req.query;
     
-    const executionResponse = await script.scripts.run({
-      scriptId: scriptId,
-      requestBody: {
-        function: functionName,
-        parameters: parameters,
-        devMode: true
+    if (!code) {
+      return res.status(400).send(`
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 40px; background: #f5f5f5;">
+            <div style="background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <h2 style="color: #d32f2f;">❌ Authorization Failed</h2>
+              <p>Authorization code not provided. Please try the authorization process again.</p>
+              <a href="/mcp/authorize" style="color: #1976d2; text-decoration: none;">🔄 Retry Authorization</a>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    console.log('✅ OAuth tokens received successfully');
+    console.log('🔑 Refresh Token:', tokens.refresh_token ? 'Present' : 'Missing');
+    
+    res.send(`
+      <html>
+        <body style="font-family: Arial, sans-serif; padding: 40px; background: #f5f5f5;">
+          <div style="background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="color: #388e3c;">✅ Authorization Successful!</h2>
+            <p>MCP Server is now authorized to access your Google account.</p>
+            <div style="background: #f8f9fa; padding: 15px; border-radius: 4px; margin: 15px 0;">
+              <strong>🔑 Refresh Token:</strong><br>
+              <code style="word-break: break-all; font-size: 12px;">${tokens.refresh_token || 'Not provided'}</code>
+            </div>
+            <p><small>Save this refresh token as GOOGLE_REFRESH_TOKEN environment variable for production use.</small></p>
+            <button onclick="window.close()" style="background: #1976d2; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">Close Window</button>
+          </div>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('❌ OAuth callback error:', error);
+    res.status(500).send(`
+      <html>
+        <body style="font-family: Arial, sans-serif; padding: 40px; background: #f5f5f5;">
+          <div style="background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="color: #d32f2f;">❌ OAuth Error</h2>
+            <p><strong>Error:</strong> ${error.message}</p>
+            <a href="/mcp/authorize" style="color: #1976d2; text-decoration: none;">🔄 Retry Authorization</a>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+});
+
+// スプレッドシート作成エンドポイント
+app.post('/create_spreadsheet', async (req, res) => {
+  try {
+    const { title } = req.body;
+    
+    if (!oauth2Client || !oauth2Client.credentials) {
+      return res.status(401).json({
+        success: false,
+        error: 'OAuth authorization required. Please call /mcp/authorize first.'
+      });
+    }
+
+    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+    
+    const resource = {
+      properties: {
+        title: title || 'New Spreadsheet'
       }
-    });
+    };
+
+    const response = await sheets.spreadsheets.create({ resource });
     
-    console.log('✅ Script executed successfully');
+    console.log(`✅ Spreadsheet created: ${response.data.spreadsheetId}`);
     
     res.json({
-      response: executionResponse.data.response,
-      success: true
+      success: true,
+      spreadsheetId: response.data.spreadsheetId,
+      url: response.data.spreadsheetUrl
     });
+    
   } catch (error) {
-    console.error('❌ Error running script:', error);
-    res.status(500).json({ 
-      error: 'Failed to run script', 
-      details: error.message 
+    console.error('❌ Spreadsheet creation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
 
-// Health Check
-app.get('/health', (req, res) => {
-  console.log('📞 Health check request');
-  
-  const healthStatus = {
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    authInitialized: !!auth,
-    hasToken: auth && !!auth.credentials.access_token,
-    credentialsFileExists: fs.existsSync(CREDENTIALS_PATH),
-    tokenFileExists: fs.existsSync(TOKEN_PATH)
-  };
-  
-  console.log('📊 Health status:', healthStatus);
-  res.json(healthStatus);
+// コンテナバインドスクリプト作成
+app.post('/create_container_bound_script', async (req, res) => {
+  try {
+    const { spreadsheetId, title } = req.body;
+    
+    if (!oauth2Client || !oauth2Client.credentials) {
+      return res.status(401).json({
+        success: false,
+        error: 'OAuth authorization required. Please call /mcp/authorize first.'
+      });
+    }
+
+    const script = google.script({ version: 'v1', auth: oauth2Client });
+    
+    const request = {
+      resource: {
+        title: title || 'Container Bound Script',
+        parentId: spreadsheetId
+      }
+    };
+
+    const response = await script.projects.create(request);
+    
+    console.log(`✅ Container bound script created: ${response.data.scriptId}`);
+    
+    res.json({
+      success: true,
+      scriptId: response.data.scriptId,
+      url: `https://script.google.com/d/${response.data.scriptId}/edit`
+    });
+    
+  } catch (error) {
+    console.error('❌ Script creation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
 });
 
-// Server startup
+// スクリプトコンテンツ更新
+app.put('/update_script_content', async (req, res) => {
+  try {
+    const { scriptId, files } = req.body;
+    
+    if (!oauth2Client || !oauth2Client.credentials) {
+      return res.status(401).json({
+        success: false,
+        error: 'OAuth authorization required'
+      });
+    }
+
+    const script = google.script({ version: 'v1', auth: oauth2Client });
+    
+    const request = {
+      scriptId: scriptId,
+      resource: {
+        files: files
+      }
+    };
+
+    const response = await script.projects.updateContent(request);
+    
+    console.log(`✅ Script content updated: ${scriptId}`);
+    
+    res.json({
+      success: true,
+      data: response.data
+    });
+    
+  } catch (error) {
+    console.error('❌ Script update error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
+});
+
+// スクリプト実行
+app.post('/run_script', async (req, res) => {
+  try {
+    const { scriptId, function: functionName, parameters = [] } = req.body;
+    
+    if (!oauth2Client || !oauth2Client.credentials) {
+      return res.status(401).json({
+        success: false,
+        error: 'OAuth authorization required'
+      });
+    }
+
+    const script = google.script({ version: 'v1', auth: oauth2Client });
+    
+    const request = {
+      scriptId: scriptId,
+      resource: {
+        function: functionName,
+        parameters: parameters
+      }
+    };
+
+    const response = await script.scripts.run(request);
+    
+    console.log(`✅ Script executed: ${scriptId}.${functionName}`);
+    
+    res.json({
+      success: true,
+      response: response.data.response
+    });
+    
+  } catch (error) {
+    console.error('❌ Script execution error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
+});
+
+// ヘルスチェック
+app.get('/health', (req, res) => {
+  const hasCredentials = !!(oauth2Client && oauth2Client.credentials);
+  const hasRefreshToken = !!(oauth2Client && oauth2Client.credentials && oauth2Client.credentials.refresh_token);
+  
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    port: PORT,
+    hasAuth: hasCredentials,
+    hasRefreshToken: hasRefreshToken,
+    authStatus: hasRefreshToken ? 'Ready' : hasCredentials ? 'Partial' : 'Not Authenticated'
+  });
+});
+
+// ルートエンドポイント（ダッシュボード）
+app.get('/', (req, res) => {
+  const hasAuth = !!(oauth2Client && oauth2Client.credentials);
+  const hasRefreshToken = !!(oauth2Client && oauth2Client.credentials && oauth2Client.credentials.refresh_token);
+  
+  res.send(`
+    <html>
+      <head>
+        <title>GAS MCP Server Dashboard</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+          .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          .status { padding: 10px; border-radius: 4px; margin: 10px 0; }
+          .ready { background: #e8f5e8; color: #2e7d32; }
+          .warning { background: #fff3e0; color: #ef6c00; }
+          .error { background: #ffebee; color: #c62828; }
+          .endpoint { background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 4px; font-family: monospace; }
+          a { color: #1976d2; text-decoration: none; }
+          a:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🚀 GAS MCP Server</h1>
+          <div class="status ${hasRefreshToken ? 'ready' : hasAuth ? 'warning' : 'error'}">
+            <strong>Status:</strong> ${hasRefreshToken ? '✅ Ready' : hasAuth ? '⚠️ Partial Auth' : '❌ Not Authenticated'}
+          </div>
+          
+          <h2>📡 Available Endpoints</h2>
+          <div class="endpoint">GET  <a href="/health">/health</a> - Health check</div>
+          <div class="endpoint">GET  <a href="/mcp/authorize">/mcp/authorize</a> - OAuth authorization URL</div>
+          <div class="endpoint">POST /oauth/token - Set OAuth token manually</div>
+          <div class="endpoint">POST /create_spreadsheet - Create spreadsheet</div>
+          <div class="endpoint">POST /create_container_bound_script - Create container bound script</div>
+          <div class="endpoint">PUT  /update_script_content - Update script content</div>
+          <div class="endpoint">POST /run_script - Execute script function</div>
+          
+          <h2>🔧 Setup Instructions</h2>
+          <ol>
+            <li>Visit <a href="/mcp/authorize">/mcp/authorize</a> to get OAuth URL</li>
+            <li>Complete OAuth flow in browser</li>
+            <li>Save refresh token to GOOGLE_REFRESH_TOKEN environment variable</li>
+            <li>Start using the API endpoints</li>
+          </ol>
+          
+          <h2>🌐 Environment</h2>
+          <div class="endpoint">Port: ${PORT}</div>
+          <div class="endpoint">Environment: ${process.env.NODE_ENV || 'development'}</div>
+          <div class="endpoint">Platform: ${process.env.RAILWAY_STATIC_URL ? 'Railway' : process.env.RENDER_EXTERNAL_URL ? 'Render' : 'Local'}</div>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// サーバー起動
 app.listen(PORT, async () => {
-  console.log(`🚀 MCP Server running on http://localhost:${PORT}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🔗 Authorization: http://localhost:${PORT}/authorize`);
+  console.log(`🚀 MCP Server running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('📝 Available endpoints:');
+  console.log('  GET  / - Dashboard');
+  console.log('  GET  /health - Health check');
+  console.log('  GET  /mcp/authorize - OAuth authorization');
+  console.log('  POST /create_spreadsheet - Create spreadsheet');
+  console.log('  POST /create_container_bound_script - Create container bound script');
+  console.log('  PUT  /update_script_content - Update script content');
+  console.log('  POST /run_script - Run script function');
   
-  await initializeAuth();
-  
-  if (!auth || !auth.credentials.access_token) {
-    console.log(`\n🔐 Authorization needed:`);
-    console.log(`1. GET http://localhost:${PORT}/authorize`);
-    console.log(`2. Visit the returned URL to authorize`);
-    console.log(`3. POST the code to http://localhost:${PORT}/callback`);
-  } else {
-    console.log('✅ Ready for Apps Script automation!');
+  try {
+    await initializeAuth();
+    console.log('✅ Server initialization completed');
+  } catch (error) {
+    console.log('⚠️ Authentication not ready. Please complete OAuth flow via /mcp/authorize');
   }
 });
 
