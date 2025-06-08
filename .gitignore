@@ -1,0 +1,46 @@
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OAuth credentials (本番では環境変数を使用)
+client_credentials.json
+credentials.json
+tokens.json
+tokenfile.json
+
+# ログファイル
+logs/
+*.log
+debug.log
+
+# 仮想環境（WSL関連）
+venv/
+venv_wsl/
+
+# Python関連
+__pycache__/
+*.py[cod]
+*.class
+*.py
+
+# OS生成ファイル
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE設定
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
