@@ -237,10 +237,23 @@ app.post('/create_spreadsheet', async (req, res) => {
   }
 });
 
-// コンテナバインドスクリプト作成
+// 🔧 修正版: コンテナバインドスクリプト作成
 app.post('/create_container_bound_script', async (req, res) => {
   try {
-    const { spreadsheetId, title } = req.body;
+    // 🎯 修正: parentId と spreadsheetId の両方をサポート
+    const { parentId, spreadsheetId, title } = req.body;
+    const targetSpreadsheetId = parentId || spreadsheetId;
+    
+    console.log('🔍 Debug - Request body:', req.body);
+    console.log('🎯 Target spreadsheet ID:', targetSpreadsheetId);
+    
+    if (!targetSpreadsheetId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required parameter. Please provide either "parentId" or "spreadsheetId".',
+        hint: 'Use "parentId" for container-bound script creation'
+      });
+    }
     
     if (!oauth2Client || !oauth2Client.credentials) {
       return res.status(401).json({
@@ -254,22 +267,28 @@ app.post('/create_container_bound_script', async (req, res) => {
     const request = {
       resource: {
         title: title || 'Container Bound Script',
-        parentId: spreadsheetId
+        parentId: targetSpreadsheetId  // 🎯 修正: 正しくparentIdを設定
       }
     };
+
+    console.log('📤 Google Apps Script API request:', JSON.stringify(request, null, 2));
 
     const response = await script.projects.create(request);
     
     console.log(`✅ Container bound script created: ${response.data.scriptId}`);
-    
+    console.log('📊 Parent container:', targetSpreadsheetId);
+
     res.json({
       success: true,
       scriptId: response.data.scriptId,
-      url: `https://script.google.com/d/${response.data.scriptId}/edit`
+      url: `https://script.google.com/d/${response.data.scriptId}/edit`,
+      parentId: targetSpreadsheetId,
+      containerBound: true
     });
     
   } catch (error) {
     console.error('❌ Script creation error:', error);
+    console.error('🔍 Error details:', error.response?.data || error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -302,7 +321,7 @@ app.put('/update_script_content', async (req, res) => {
     const response = await script.projects.updateContent(request);
     
     console.log(`✅ Script content updated: ${scriptId}`);
-    
+
     res.json({
       success: true,
       data: response.data
@@ -343,7 +362,7 @@ app.post('/run_script', async (req, res) => {
     const response = await script.scripts.run(request);
     
     console.log(`✅ Script executed: ${scriptId}.${functionName}`);
-    
+
     res.json({
       success: true,
       response: response.data.response
@@ -371,7 +390,8 @@ app.get('/health', (req, res) => {
     port: PORT,
     hasAuth: hasCredentials,
     hasRefreshToken: hasRefreshToken,
-    authStatus: hasRefreshToken ? 'Ready' : hasCredentials ? 'Partial' : 'Not Authenticated'
+    authStatus: hasRefreshToken ? 'Ready' : hasCredentials ? 'Partial' : 'Not Authenticated',
+    version: 'v2-fixed'
   });
 });
 
@@ -383,7 +403,7 @@ app.get('/', (req, res) => {
   res.send(`
     <html>
       <head>
-        <title>GAS MCP Server Dashboard</title>
+        <title>GAS MCP Server v2 (Fixed) Dashboard</title>
         <style>
           body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
           .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -392,15 +412,23 @@ app.get('/', (req, res) => {
           .warning { background: #fff3e0; color: #ef6c00; }
           .error { background: #ffebee; color: #c62828; }
           .endpoint { background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 4px; font-family: monospace; }
+          .fix { background: #e3f2fd; padding: 15px; border-radius: 4px; margin: 15px 0; }
           a { color: #1976d2; text-decoration: none; }
           a:hover { text-decoration: underline; }
         </style>
       </head>
       <body>
         <div class="container">
-          <h1>🚀 GAS MCP Server</h1>
+          <h1>🚀 GAS MCP Server v2 (Fixed)</h1>
           <div class="status ${hasRefreshToken ? 'ready' : hasAuth ? 'warning' : 'error'}">
             <strong>Status:</strong> ${hasRefreshToken ? '✅ Ready' : hasAuth ? '⚠️ Partial Auth' : '❌ Not Authenticated'}
+          </div>
+          
+          <div class="fix">
+            <strong>🔧 Container Bind Fix Applied:</strong><br>
+            ✅ Supports both "parentId" and "spreadsheetId" parameters<br>
+            ✅ Enhanced debugging and error handling<br>
+            ✅ Proper container-bound script creation
           </div>
           
           <h2>📡 Available Endpoints</h2>
@@ -408,7 +436,7 @@ app.get('/', (req, res) => {
           <div class="endpoint">GET  <a href="/mcp/authorize">/mcp/authorize</a> - OAuth authorization URL</div>
           <div class="endpoint">POST /oauth/token - Set OAuth token manually</div>
           <div class="endpoint">POST /create_spreadsheet - Create spreadsheet</div>
-          <div class="endpoint">POST /create_container_bound_script - Create container bound script</div>
+          <div class="endpoint">POST /create_container_bound_script - Create container bound script (FIXED)</div>
           <div class="endpoint">PUT  /update_script_content - Update script content</div>
           <div class="endpoint">POST /run_script - Execute script function</div>
           
@@ -422,6 +450,7 @@ app.get('/', (req, res) => {
           
           <h2>🌐 Environment</h2>
           <div class="endpoint">Port: ${PORT}</div>
+          <div class="endpoint">Version: v2-fixed</div>
           <div class="endpoint">Environment: ${process.env.NODE_ENV || 'development'}</div>
           <div class="endpoint">Platform: ${process.env.RAILWAY_STATIC_URL ? 'Railway' : process.env.RENDER_EXTERNAL_URL ? 'Render' : 'Local'}</div>
         </div>
@@ -432,14 +461,15 @@ app.get('/', (req, res) => {
 
 // サーバー起動
 app.listen(PORT, async () => {
-  console.log(`🚀 MCP Server running on port ${PORT}`);
+  console.log(`🚀 MCP Server v2 (Fixed) running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('🔧 Container Bind Fix: Applied');
   console.log('📝 Available endpoints:');
   console.log('  GET  / - Dashboard');
   console.log('  GET  /health - Health check');
   console.log('  GET  /mcp/authorize - OAuth authorization');
   console.log('  POST /create_spreadsheet - Create spreadsheet');
-  console.log('  POST /create_container_bound_script - Create container bound script');
+  console.log('  POST /create_container_bound_script - Create container bound script (FIXED)');
   console.log('  PUT  /update_script_content - Update script content');
   console.log('  POST /run_script - Run script function');
   
